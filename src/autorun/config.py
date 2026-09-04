@@ -327,8 +327,18 @@ def _parse_params(raw: Any, where: str) -> dict[str, ParamSpec]:
             raise ConfigError(
                 f"{where}.params.{name}: 必须声明 pattern（无正则白名单的参数不允许使用）"
             )
+        raw_pattern = str(spec["pattern"])
+        # 空 pattern 用 fullmatch 匹配时只接受空字符串，任何非空输入都会被拒 ——
+        # 而写下 `pattern: ""` 的人几乎总是想表达"不限制"。语义正好相反，
+        # 且报错信息（"不满足格式 ()"）毫无提示性，所以在启动时就拦住。
+        if not raw_pattern:
+            raise ConfigError(
+                f"{where}.params.{name}.pattern 为空。空正则只匹配空字符串，"
+                f'任何输入都会被拒绝。若要接受任意单行文本请写 pattern: "^.*$"，'
+                f"但更推荐收窄到实际需要的形状"
+            )
         try:
-            pattern = re.compile(str(spec["pattern"]))
+            pattern = re.compile(raw_pattern)
         except re.error as exc:
             raise ConfigError(f"{where}.params.{name}.pattern 无效: {exc}") from exc
         max_length = int(spec.get("max_length", 256))
