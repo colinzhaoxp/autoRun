@@ -1,0 +1,139 @@
+# autoRun 参考配置。
+#
+# 使用方式：
+#   cp config/config.example.yaml config/config.yaml
+#   chmod 600 config/config.yaml          # 必须，否则服务拒绝启动
+#   export AUTORUN_KEY_ADMIN="$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))')"
+#
+# 相对路径一律相对于**项目根目录**（即本文件的上一级），不受进程 cwd 影响。
+
+version: 1
+
+server:
+  host: "127.0.0.1"             # 默认只监听回环。要对外提供服务改成 "0.0.0.0"，
+                                # 但请同时启用 TLS 或置于 nginx/VPN 之后。
+  port: 8770
+  max_request_body_bytes: 65536
+  socket_timeout_sec: 15        # 读写超时，防 slowloris 慢速攻击
+  max_worker_threads: 16
+  shutdown_grace_sec: 10
+  kill_jobs_on_shutdown: false  # false：服务重启不打断正在跑的任务
+
+tls:
+  enabled: false
+  cert_file: null
+  key_file: null
+  client_ca_file: null          # 填入 CA 证书即要求 mTLS（最强的访问控制）
+
+auth:
+  header: "X-Auth-Key"
+  min_key_length: 32            # 密钥短于此长度则拒绝启动
+  keys:
+    - id: "admin"
+      key: "${AUTORUN_KEY_ADMIN}"   # 从环境变量读取，密钥不落 YAML
+      allowed_aliases: ["*"]
+      allow_raw: true
+      allow_kill: true
+    # 最小权限的示例调用方：只能跑指定别名，不能执行裸命令。
+    # - id: "ci-bot"
+    #   key: "${AUTORUN_KEY_CI}"
+    #   allowed_aliases: ["deploy", "disk_usage"]
+    #   allow_raw: false
+    #   allow_kill: true
+    #   allowed_ips: ["10.20.0.0/24"]   # 在全局白名单之上按 key 再收窄
+
+security:
+  ip_whitelist:                 # 必填。空列表会拒绝启动（避免"空=全放通"的误解）
+    - "127.0.0.1/32"
+    - "::1/128"
+    # - "10.20.0.0/24"
+  trust_proxy: false            # false 时完全忽略 X-Forwarded-For，socket 对端是唯一可信来源
+  trusted_proxies: []           # trust_proxy 为真时必填
+  allow_raw_commands: false     # 裸命令执行的全局开关。开启等于开放受认证的 RCE。
+  raw_command_denylist:         # 仅对裸命令生效；属纵深防御，不是安全边界
+    - "(?i)\\brm\\s+-rf\\s+/(\\s|$)"
+    - "(?i)\\bmkfs\\b"
+    - "(?i)\\bdd\\s+.*of=/dev/"
+    - ":\\(\\)\\s*\\{.*\\};:"
+  allow_kill_untracked_pids: false   # 只允许杀本服务启动的任务
+  health_requires_auth: false   # /healthz 免密钥，但仍需通过 IP 白名单
+
+rate_limit:
+  enabled: true
+  requests_per_minute: 60
+  burst: 20
+  per_key: true                 # 按 (客户端IP, key_id) 分桶
+
+execution:
+  shell: "/bin/bash"
+  shell_args: ["-lc"]
+  default_cwd: "/"
+  default_timeout_sec: 900
+  max_timeout_sec: 7200
+  max_concurrent_jobs: 10
+  max_output_bytes: 52428800    # 单任务日志上限 50 MiB
+  on_output_limit: "kill"       # kill：超限即终止任务；warn：仅告警
+  env_passthrough: ["PATH", "LANG", "HOME"]
+  env_extra:
+    AUTORUN: "1"
+  run_as:                       # 通过 setpriv 为所有任务降权（强烈建议在 root 下运行时配置）
+    user: null
+    group: null
+
+# 预定义命令别名。客户端只能提交别名和已声明的参数值，永远无法提交命令体本身。
+commands:
+  # argv 形式：完全不经过 shell，最安全。
+  disk_usage:
+    description: "查看磁盘占用"
+    argv: ["/bin/df", "-h"]
+    mode: "sync"                # 短命令，同步返回输出
+    timeout_sec: 10
+
+  uptime:
+    description: "查看系统负载"
+    argv: ["/usr/bin/uptime"]
+    mode: "sync"
+    timeout_sec: 10
+
+  # shell 形式：支持管道与 && 等语法。
+  # deploy:
+  #   description: "拉取最新代码并重启"
+  #   shell: "cd /app && git pull --ff-only && ./restart.sh"
+  #   cwd: "/app"
+  #   timeout_sec: 1800
+  #   singleton: true           # 已有实例在跑时拒绝，避免并发部署
+
+  # 带参数：每个参数必须声明 pattern（正则白名单），否则拒绝启动。
+  # 值先经 re.fullmatch 校验，通过后再用 shlex.quote 代入。
+  # rollback:
+  #   description: "回滚到指定版本"
+  #   shell: "cd /app && ./rollback.sh {tag}"
+  #   params:
+  #     tag:
+  #       required: true
+  #       pattern: "^v[0-9]+\\.[0-9]+\\.[0-9]+$"
+  #       max_length: 32
+  #   timeout_sec: 600
+
+paths:
+  pid_file: "runtime/autorun.pid"
+  state_dir: "runtime/state"          # processes.json / processes.txt / .registry.lock
+  job_log_dir: "runtime/logs/jobs"    # 每个任务一个 <job_id>.log
+
+logging:
+  level: "INFO"
+  audit_file: "runtime/logs/audit.jsonl"    # 审计流水，每行一个 JSON
+  service_file: "runtime/logs/service.log"  # 服务自身运行日志与堆栈
+  rotation:
+    strategy: "size"            # size | time
+    max_bytes: 52428800
+    when: "midnight"            # strategy 为 time 时生效
+    backup_count: 14
+  redact_patterns:              # 落日志前对命令文本脱敏
+    - "(?i)(password|passwd|token|secret|api[_-]?key)\\s*=\\s*\\S+"
+    - "(?i)Authorization:\\s*\\S+"
+
+registry:
+  retain_finished_hours: 72     # 已结束任务的保留时长
+  max_records: 2000
+  render_text_view: true        # 额外渲染人类可读的 processes.txt

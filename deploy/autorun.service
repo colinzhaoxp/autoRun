@@ -1,0 +1,51 @@
+# autoRun systemd unit
+#
+# 安装：
+#   cp deploy/autorun.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now autorun
+#   systemctl reload autorun          # 热加载 .env 与 config.yaml
+#
+# 密钥默认从项目根目录的 .env 读取（WorkingDirectory 指向项目），与手动运行完全一致。
+# 若更倾向 systemd 原生方式，取消下面 EnvironmentFile 的注释，并给 ExecStart 加
+# --no-env-file：
+#   printf 'AUTORUN_KEY_ADMIN=%s\n' "$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))')" \
+#     > /etc/autorun/env && chmod 600 /etc/autorun/env
+
+[Unit]
+Description=autoRun remote command execution service
+Documentation=file:/root/zhaoxp/workspace/autoRun/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 前台模式：进程监督交给 systemd，不要用 start 子命令自行双 fork。
+ExecStart=/root/miniconda3/bin/python -m autorun -c config/config.yaml foreground
+ExecReload=/bin/kill -HUP $MAINPID
+WorkingDirectory=/root/zhaoxp/workspace/autoRun
+Environment=PYTHONPATH=/root/zhaoxp/workspace/autoRun/src
+Environment=PYTHONUNBUFFERED=1
+# EnvironmentFile=/etc/autorun/env
+
+# 建议以非 root 运行，并在 config 中配置 execution.run_as 进一步降权。
+# User=autorun
+# Group=autorun
+
+Restart=on-failure
+RestartSec=5s
+
+# KillMode=process 很关键：默认的 control-group 模式会在服务停止时连带杀死所有
+# 子进程，那样每次重启都会打断正在执行的长任务 —— 与 kill_jobs_on_shutdown
+# 默认 false 的设计意图相反。
+KillMode=process
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# 基础加固。注意 ReadWritePaths 必须涵盖 runtime/ 下的状态与日志目录。
+NoNewPrivileges=false
+PrivateTmp=false
+ProtectSystem=false
+ReadWritePaths=/root/zhaoxp/workspace/autoRun/runtime
+
+[Install]
+WantedBy=multi-user.target

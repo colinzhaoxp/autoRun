@@ -1,0 +1,33 @@
+# autoRun 日志轮转。安装：cp deploy/autorun.logrotate /etc/logrotate.d/autorun
+#
+# 服务自身也带轮转（logging.rotation），两者可任选其一。若使用本文件，建议把
+# logging.rotation.max_bytes 设得很大以免两套机制互相干扰。
+#
+# 用 copytruncate 而不是 create：服务进程持有日志文件句柄，改名后它仍会往旧 inode
+# 写入，新文件会一直是空的。copytruncate 先复制再截断，进程无需感知。
+
+/root/zhaoxp/workspace/autoRun/runtime/logs/audit.jsonl
+/root/zhaoxp/workspace/autoRun/runtime/logs/service.log {
+    daily
+    rotate 30
+    size 50M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    create 0640 root root
+}
+
+# 任务日志按文件数量清理即可，它们不会被持续追加（任务结束即不再写入）。
+/root/zhaoxp/workspace/autoRun/runtime/logs/jobs/*.log {
+    weekly
+    rotate 4
+    missingok
+    notifempty
+    compress
+    maxage 30
+    # 不用 copytruncate：运行中的任务正在写这些文件，截断会丢掉已产生的输出。
+    # 交给 registry.retain_finished_hours 与本处的 maxage 共同控制体积。
+    nocreate
+}

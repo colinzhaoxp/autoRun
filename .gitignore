@@ -1,0 +1,9 @@
+config/config.yaml
+.env
+*.pem
+*.crt
+*.key
+runtime/
+__pycache__/
+*.py[cod]
+.pytest_cache/
