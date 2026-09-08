@@ -228,6 +228,57 @@ commands:
 `commands`、`auth.keys`、`security`、`rate_limit`、`logging.level` 支持热加载；
 `server.*`、`tls.*`、`paths.*` 需要重启。
 
+## 常驻型任务（长期后台运行）
+
+`mode: "background"` 只决定 HTTP 要不要等结果，**它不足以让程序长期运行** —— 还有两个
+设置会在你没注意时把它杀掉：
+
+| 设置 | 默认行为 | 常驻任务要怎么配 |
+|---|---|---|
+| `timeout_sec` | 到点 TERM → KILL，且受 `max_timeout_sec`（默认 2 小时）封顶 | 写 `timeout_sec: 0` 表示**不限时** |
+| `on_output_limit` | `kill`：日志超 `max_output_bytes` 即终止 | 改成 `warn`，只告警不终止 |
+
+完整写法：
+
+```yaml
+execution:
+  on_output_limit: "warn"      # 常驻任务持续输出日志时必须改这里
+
+commands:
+  my_daemon:
+    description: "常驻程序"
+    shell: "exec /path/to/your/program --flag"
+    cwd: "/path/to/workdir"
+    timeout_sec: 0             # 0 = 不限时，永不因超时被终止
+    mode: "background"
+    singleton: true            # 避免重复提交起出第二个实例
+```
+
+用 `0` 而不是填一个巨大的数字，是为了让意图在配置里一眼可见 —— `999999999` 看不出到底是
+"不限时"还是"算错了"。启动时会就此告警，提醒你这类任务不会被自动回收：
+
+```
+WARNING  以下命令配置为不限时（timeout_sec: 0），不会被超时终止，需自行 kill 或等其退出: my_daemon
+```
+
+不限时**不等于杀不掉**，`kill` 端点和 `autorun kill` 照常有效。客户端也不能把一个有限
+任务改成不限时（`timeout_sec: 0` 会被拒），只有服务端配置能声明 —— 否则任何调用方都能
+绕过服务端的资源约束。
+
+**autoRun 不是进程监督器。** 程序崩溃退出后它不会自动重启，只会把状态记成 `failed`。
+如果你需要"挂了自动拉起"，正确的工具是 systemd：给你的程序写一个 unit，然后让 autoRun
+远程触发 `systemctl restart your-app`（用 `argv` 形式，完全不经过 shell）：
+
+```yaml
+commands:
+  restart_app:
+    argv: ["/bin/systemctl", "restart", "your-app"]
+    timeout_sec: 120
+```
+
+另外注意常驻任务会长期占用一个 `max_concurrent_jobs` 名额（默认 10），起多个常驻任务时
+记得把这个上限调大。
+
 ## 日志与审计
 
 三条独立的流：
@@ -331,7 +382,7 @@ export PYTHONPATH=$PWD/src
 python -m pytest tests/ -v
 ```
 
-148 个用例。重点分布：
+166 个用例。重点分布：
 
 - `test_commands_injection.py` —— 18 类注入载荷，断言无副作用而非仅返回 422
 - `test_security.py` —— 中间件顺序（有效密钥 + 非白名单 IP 必须 403）、XFF 伪造、ACL
@@ -339,6 +390,8 @@ python -m pytest tests/ -v
 - `test_registry.py` —— 并发写入下无半截 JSON、PID 复用、清理策略
 - `test_api_e2e.py` —— 真实 socket 与真实进程的完整链路
 - `test_envfile.py` —— .env 解析边界、权限校验、优先级、热轮换覆盖范围
+- `test_unlimited_jobs.py` —— `timeout_sec: 0` 不被当成假值、不限时任务熬过监控周期、
+  客户端无法自行声明不限时
 
 ## 项目结构
 

@@ -407,8 +407,11 @@ def _parse_command(name: str, raw: Any, base: Path) -> CommandSpec:
     timeout = raw.get("timeout_sec")
     if timeout is not None:
         timeout = int(timeout)
-        if timeout <= 0:
-            raise ConfigError(f"{where}.timeout_sec 必须为正数")
+        # 0 是显式的"不限时"，用于常驻型任务。用 0 而不是省略字段或填一个巨大的数字，
+        # 是为了让意图在配置里一眼可见 —— 省略会落到 default_timeout_sec，
+        # 填 999999999 则看不出到底是"不限时"还是"算错了"。
+        if timeout < 0:
+            raise ConfigError(f"{where}.timeout_sec 必须为正数，或为 0 表示不限时")
 
     cwd = raw.get("cwd")
     return CommandSpec(
@@ -594,6 +597,7 @@ def load(path: str | os.PathLike[str]) -> Config:
         raise ConfigError("commands 必须是映射")
     commands = {str(k): _parse_command(str(k), v, base) for k, v in cmd_raw.items()}
     for spec in commands.values():
+        # timeout_sec == 0 表示不限时，不受 max_timeout_sec 约束（这是配置方的显式决定）。
         if spec.timeout_sec and spec.timeout_sec > execution.max_timeout_sec:
             raise ConfigError(
                 f"commands.{spec.name}.timeout_sec 超过 execution.max_timeout_sec"
@@ -664,6 +668,14 @@ def load(path: str | os.PathLike[str]) -> Config:
     if security.allow_raw_commands:
         warnings.append(
             "security.allow_raw_commands 已开启：持有 allow_raw 密钥者可执行任意命令。"
+        )
+    unlimited = sorted(n for n, s in commands.items() if s.timeout_sec == 0)
+    if unlimited:
+        # 不限时任务不会被自动回收，只能靠 kill 或它自己退出。明确提示，
+        # 避免"起了就忘"最终占满 max_concurrent_jobs 的名额。
+        warnings.append(
+            f"以下命令配置为不限时（timeout_sec: 0），不会被超时终止，"
+            f"需自行 kill 或等其退出: {', '.join(unlimited)}"
         )
 
     return Config(

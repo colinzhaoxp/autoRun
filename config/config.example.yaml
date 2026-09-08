@@ -73,6 +73,7 @@ execution:
   max_concurrent_jobs: 10
   max_output_bytes: 52428800    # 单任务日志上限 50 MiB
   on_output_limit: "kill"       # kill：超限即终止任务；warn：仅告警
+                                # 有常驻型任务持续输出日志时请改成 warn
   env_passthrough: ["PATH", "LANG", "HOME"]
   env_extra:
     AUTORUN: "1"
@@ -102,6 +103,16 @@ commands:
   #   cwd: "/app"
   #   timeout_sec: 1800
   #   singleton: true           # 已有实例在跑时拒绝，避免并发部署
+
+  # 常驻型任务：timeout_sec: 0 表示不限时，永不因超时被终止。
+  # 配 singleton: true 避免重复提交起出第二个实例。
+  # 注意 autoRun 不是进程监督器：程序崩溃不会自动重启，需要这个能力请用 systemd。
+  # daemon_example:
+  #   description: "常驻程序（不限时）"
+  #   shell: "exec /path/to/your/program --flag"
+  #   timeout_sec: 0
+  #   mode: "background"
+  #   singleton: true
 
   # 带参数：每个参数必须声明 pattern（正则白名单），否则拒绝启动。
   # 值先经 re.fullmatch 校验，通过后再用 shlex.quote 代入。

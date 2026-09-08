@@ -170,9 +170,12 @@ def _launch(
 
     if prepared.mode == "sync":
         # 同步等待的预算要给 socket 超时留余量，否则连接先断，客户端拿不到结果。
-        budget = min(
-            float(prepared.timeout_sec),
-            max(ctx.cfg.server.socket_timeout_sec - 2.0, 1.0),
+        socket_budget = max(ctx.cfg.server.socket_timeout_sec - 2.0, 1.0)
+        # 不限时任务（timeout_sec == 0）只受 socket 预算约束
+        budget = (
+            socket_budget
+            if prepared.timeout_sec == 0
+            else min(float(prepared.timeout_sec), socket_budget)
         )
         rec, finished = ctx.executor.wait_sync(rec.job_id, budget)
         tail = _read_tail(rec.log_file, 8192)

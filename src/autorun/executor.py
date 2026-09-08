@@ -186,7 +186,11 @@ class Executor:
                 },
                 proc_starttime_ticks=procutil.read_starttime_ticks(proc.pid),
                 timeout_sec=prepared.timeout_sec,
-                deadline_monotonic=time.monotonic() + prepared.timeout_sec,
+                # timeout_sec == 0 表示不限时：deadline 置 None，监控线程的超时分支
+                # 会直接跳过它，任务只能由 kill 或自身退出来结束。
+                deadline_monotonic=(
+                    time.monotonic() + prepared.timeout_sec if prepared.timeout_sec else None
+                ),
                 log_file=str(log_path),
             )
             reg.stage(record)  # 已持锁；退出事务时统一落盘

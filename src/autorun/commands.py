@@ -125,12 +125,22 @@ def _render_argv(argv: tuple[str, ...], values: Mapping[str, str]) -> tuple[str,
 
 
 def _clamp_timeout(requested: int | None, spec_timeout: int | None, ex: ExecutionConfig) -> int:
-    base = spec_timeout or ex.default_timeout_sec
+    """返回实际生效的超时秒数。**0 表示不限时。**
+
+    注意 `spec_timeout` 用 `is None` 判断而不是真值判断：0 是合法且有意义的取值
+    （不限时），`spec_timeout or default` 会把它悄悄换成默认超时，那正是这个功能
+    最容易出错的地方。
+    """
+    base = ex.default_timeout_sec if spec_timeout is None else spec_timeout
     if requested is None:
+        # 不限时由服务端配置显式声明，不受 max_timeout_sec 约束。
+        if base == 0:
+            return 0
         return min(base, ex.max_timeout_sec)
+    # 客户端只能缩短，不能延长，也不能把有限的任务改成不限时 ——
+    # 否则任何调用方都能绕过服务端的资源约束。
     if requested <= 0:
-        raise ValidationError("timeout_sec 必须为正数")
-    # 客户端可以缩短，但不能突破服务端上限。
+        raise ValidationError("timeout_sec 必须为正数（不限时只能由服务端配置声明）")
     return min(requested, ex.max_timeout_sec)
 
 
@@ -234,7 +244,11 @@ def describe_for_key(cfg: Config, allowed: tuple[str, ...]) -> list[dict[str, An
                 "description": spec.description,
                 "mode": spec.mode,
                 "singleton": spec.singleton,
-                "timeout_sec": spec.timeout_sec or cfg.execution.default_timeout_sec,
+                # 同样用 is None 区分"未配置"与"配置为 0（不限时）"
+                "timeout_sec": (
+                    cfg.execution.default_timeout_sec if spec.timeout_sec is None else spec.timeout_sec
+                ),
+                "unlimited_runtime": spec.timeout_sec == 0,
                 "params": {
                     pname: {
                         "required": p.required,
