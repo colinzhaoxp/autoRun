@@ -29,18 +29,25 @@ auth:
   header: "X-Auth-Key"
   min_key_length: 32            # 密钥短于此长度则拒绝启动
   keys:
+    # 管理员密钥：权限最大，可执行所有别名 + 裸命令 + kill。等于受认证的远程任意
+    # 命令执行，务必严格保管，只留给本人使用。
     - id: "admin"
       key: "${AUTORUN_KEY_ADMIN}"   # 从环境变量读取，密钥不落 YAML
-      allowed_aliases: ["*"]
-      allow_raw: true
-      allow_kill: true
-    # 最小权限的示例调用方：只能跑指定别名，不能执行裸命令。
+      allowed_aliases: ["*"]        # "*" = 所有别名
+      allow_raw: true               # 允许执行未预定义的裸命令
+      allow_kill: true              # 允许 kill 任务
+
+    # CI 专用密钥（最小权限调用方）：给自动化系统（CI/CD、脚本、机器人）用。
+    # 与 admin 相反，只放开它该干的那几件事，即使泄露也炸不掉机器。
+    # 每个调用方一把独立密钥，审计日志里以 id 区分是谁发起的请求。
+    # 启用步骤：① 取消下面几行注释 ② 在 .env 里设 AUTORUN_KEY_CI=<强密钥>
+    #          ③ allowed_aliases 改成实际要放开的别名 ④ reload/restart
     # - id: "ci-bot"
     #   key: "${AUTORUN_KEY_CI}"
-    #   allowed_aliases: ["deploy", "disk_usage"]
-    #   allow_raw: false
+    #   allowed_aliases: ["deploy", "disk_usage"]  # 只能跑这几个预定义别名
+    #   allow_raw: false            # 禁止裸命令（最小权限的关键）
     #   allow_kill: true
-    #   allowed_ips: ["10.20.0.0/24"]   # 在全局白名单之上按 key 再收窄
+    #   allowed_ips: ["10.20.0.0/24"]   # 可选：在全局白名单之上按 key 再收窄来源
 
 security:
   ip_whitelist:                 # 必填。空列表会拒绝启动（避免"空=全放通"的误解）
@@ -156,3 +163,69 @@ registry:
   retain_finished_hours: 72     # 已结束任务的保留时长
   max_records: 2000
   render_text_view: true        # 额外渲染人类可读的 processes.txt
+
+# GPU 利用率监控（可选）。训练集群里 GPU 长时间空闲通常意味着训练挂了或没起来，
+# 卡白占着；开启后可自动发现并处置。采样用 nvidia-smi，零额外依赖。
+# 监控线程独立于请求处理：采样超时、nvidia-smi 缺失、动作失败都只记日志，不影响服务。
+gpu_monitor:
+  enabled: false
+  nvidia_smi: null              # null=自动 which；受限 PATH 下写绝对路径，
+                                # 例如 "/home/opt/cuda_tools/nvidia-smi"
+  interval_sec: 15              # 采样周期
+  sample_timeout_sec: 10        # 单次 nvidia-smi 超时（它偶尔会 hang）
+  idle_util_threshold: 20       # 单卡利用率低于此值算"空闲"，用于 idle_count 指标
+
+  # 可配多条规则。每条独立维护去抖状态（以 name 为键，name 必须唯一）。
+  rules:
+    - name: "gpu-idle"                 # 唯一标识，用于去抖状态与日志/审计关联
+      metric: "avg_util"               # avg_util | idle_count | min_gpu_util
+                                       #  | max_gpu_util | max_temp | max_mem_util
+      comparator: "below"              # below | above
+      threshold: 30
+      duration_sec: 300                # 连续满足 5 分钟才触发（去抖，避免瞬时波动误报）
+      cooldown_sec: 1800               # 触发后 30 分钟内不重复（避免告警轰炸）
+      notify_resolved: true            # 恢复正常后发一封"已恢复"通知
+      actions:                         # 可组合，单个动作失败不影响其余
+        - type: "log"                  # 写审计(gpu_alert)+服务日志
+        # - type: "exec"               # 执行预定义别名（复用 commands 段）
+        #   alias: "pkill_gpu"         # 别名必须已在 commands 中定义，否则启动即报错
+        # - type: "email"              # 发邮件，需下方 smtp 段 + .env 里的 SMTP_USER/SMTP_PASS
+        #   to: ["ops@corp.com"]       # 收件人列表
+
+    # - name: "too-many-idle"
+    #   metric: "idle_count"
+    #   comparator: "above"
+    #   threshold: 4                    # 超过 4 张卡空闲
+    #   duration_sec: 600
+    #   cooldown_sec: 3600
+    #   actions:
+    #     - type: "email"
+    #       to: ["ops@corp.com"]
+
+# 邮件通知配置。仅当上面存在 email 动作时才需要（否则整段可省略/注释）。
+#
+# 使用前提：在 .env 里补两个变量（YAML 用 ${...} 引用，密钥不落 YAML）：
+#   SMTP_USER=你的完整邮箱地址        # 如 alice@163.com
+#   SMTP_PASS=客户端授权码            # 不是登录密码！在邮箱网页版开启 SMTP 后获取
+#
+# 常见邮箱服务器（都用 SSL 465）：
+#   163 邮箱 : host: "smtp.163.com"   （注意不是 ssmtp.163.com）
+#   QQ 邮箱  : host: "smtp.qq.com"
+#   Gmail    : host: "smtp.gmail.com"（需用应用专用密码）
+#
+# 重要：对 163/QQ 等，from_addr 必须与 username(即 SMTP_USER) 是同一个邮箱地址，
+#       否则服务器会以"发件人与认证账号不符"拒信（常见 553 报错）。
+#
+# 审计与日志不会打印 password。
+# smtp:
+#   host: "smtp.163.com"
+#   port: 465
+#   security: "ssl"             # ssl(465) | starttls(587) | none；端口可省略按此推断
+#   username: "${SMTP_USER}"    # 登录账号 = 完整邮箱地址
+#   password: "${SMTP_PASS}"    # 客户端授权码，放 .env
+#   from_addr: "alice@163.com"  # 发件人；须等于 username 对应的邮箱
+#   timeout_sec: 15
+#   # 若本机无公网直连出口、只有 HTTP 代理（内网集群常见），填代理地址，发信会
+#   # 经 CONNECT 隧道走代理。留空/去掉则直连。smtplib 不认 http_proxy 环境变量，
+#   # 所以必须在这里显式配置。
+#   proxy: "http://your-proxy-host:8188"

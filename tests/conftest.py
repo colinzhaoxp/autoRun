@@ -25,6 +25,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from autorun import config, logging_setup, server  # noqa: E402
 from autorun.audit import AuditLog  # noqa: E402
 from autorun.executor import Executor  # noqa: E402
+from autorun.monitor import GpuMonitor  # noqa: E402
+from autorun.notify import EmailNotifier  # noqa: E402
 from autorun.registry import Registry  # noqa: E402
 from autorun.routes import AppContext  # noqa: E402
 from autorun.security import IdempotencyCache, RateLimiter  # noqa: E402
@@ -157,6 +159,9 @@ def ctx(cfg: config.Config):
     registry = Registry(cfg.paths.state_dir, cfg.registry)
     executor = Executor(cfg, registry, audit)
     executor.start_monitor()
+    notifier = EmailNotifier(cfg.smtp) if cfg.smtp is not None else None
+    gpu_monitor = GpuMonitor(cfg, executor, audit, notifier)
+    # 不调用 start()：API 测试通过注入快照读取，无需真实采样线程与真实 GPU。
     context = AppContext(
         config=cfg,
         registry=registry,
@@ -164,8 +169,10 @@ def ctx(cfg: config.Config):
         audit=audit,
         rate_limiter=RateLimiter(cfg),
         idempotency=IdempotencyCache(),
+        gpu_monitor=gpu_monitor,
     )
     yield context
+    gpu_monitor.stop()
     executor.stop_monitor()
     for rec in registry.running():
         import signal as _sig

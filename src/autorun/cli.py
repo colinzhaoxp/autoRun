@@ -11,11 +11,13 @@ import threading
 import time
 from pathlib import Path
 
-from . import __version__, config, envfile, logging_setup, server
+from . import __version__, config, envfile, gpu, logging_setup, server
 from .audit import AuditLog
 from .daemon import PidFile, daemonize, install_signal_handlers, send_signal
 from .errors import AppError, ConfigError
 from .executor import Executor
+from .monitor import GpuMonitor
+from .notify import EmailNotifier
 from .registry import Registry, render_table
 from .routes import AppContext
 from .security import IdempotencyCache, RateLimiter
@@ -46,6 +48,8 @@ def _build_context(cfg: config.Config, *, foreground: bool) -> AppContext:
     audit = AuditLog(cfg.logging)
     registry = Registry(cfg.paths.state_dir, cfg.registry)
     executor = Executor(cfg, registry, audit)
+    notifier = EmailNotifier(cfg.smtp) if cfg.smtp is not None else None
+    gpu_monitor = GpuMonitor(cfg, executor, audit, notifier)
     return AppContext(
         config=cfg,
         registry=registry,
@@ -53,6 +57,7 @@ def _build_context(cfg: config.Config, *, foreground: bool) -> AppContext:
         audit=audit,
         rate_limiter=RateLimiter(cfg),
         idempotency=IdempotencyCache(),
+        gpu_monitor=gpu_monitor,
     )
 
 
@@ -71,6 +76,8 @@ def _run_service(cfg: config.Config, *, foreground: bool) -> int:
     # 无法区分哪些是孤儿。
     ctx.executor.reconcile()
     ctx.executor.start_monitor()
+    if ctx.gpu_monitor is not None:
+        ctx.gpu_monitor.start()
 
     stop_event = threading.Event()
 
@@ -125,6 +132,8 @@ def _run_service(cfg: config.Config, *, foreground: bool) -> int:
     try:
         server.serve_forever(httpd, stop_event)
     finally:
+        if ctx.gpu_monitor is not None:
+            ctx.gpu_monitor.stop()
         ctx.executor.shutdown()
         ctx.registry.flush()
         ctx.registry.close()
@@ -147,6 +156,23 @@ def cmd_validate(args: argparse.Namespace) -> int:
     print(f"  命令别名  : {', '.join(cfg.commands) or '(无)'}")
     print(f"  裸命令    : {'开启' if cfg.security.allow_raw_commands else '关闭'}")
     print(f"  状态目录  : {cfg.paths.state_dir}")
+    gm = cfg.gpu_monitor
+    if gm.enabled:
+        smi = gpu.resolve_nvidia_smi(gm.nvidia_smi) or "(未找到)"
+        print(
+            f"  GPU 监控  : 开启  interval={gm.interval_sec:g}s  "
+            f"rules={len(gm.rules)}  nvidia-smi={smi}"
+        )
+        for r in gm.rules:
+            acts = ",".join(a.type for a in r.actions)
+            print(
+                f"            - {r.name}: {r.metric} {r.comparator} {r.threshold:g}"
+                f"  duration={r.duration_sec}s cooldown={r.cooldown_sec}s  actions=[{acts}]"
+            )
+    else:
+        print("  GPU 监控  : 关闭")
+    if cfg.smtp is not None:
+        print(f"  SMTP      : {cfg.smtp.host}:{cfg.smtp.port} ({cfg.smtp.security})")
     for w in cfg.warnings:
         print(f"  [警告] {w}")
     return 0
@@ -254,6 +280,22 @@ def cmd_kill(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_gpu(args: argparse.Namespace) -> int:
+    """本机采样一次 GPU 并打印，不依赖服务在跑。用于手动巡检。"""
+    cfg = _load(args.config)
+    path = gpu.resolve_nvidia_smi(cfg.gpu_monitor.nvidia_smi)
+    snap = gpu.sample(
+        path,
+        timeout=cfg.gpu_monitor.sample_timeout_sec,
+        idle_util_threshold=cfg.gpu_monitor.idle_util_threshold,
+    )
+    if args.json:
+        print(json.dumps(snap.to_dict(), ensure_ascii=False, indent=2))
+    else:
+        print(gpu.render_table(snap))
+    return 0 if snap.ok else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="autorun", description="autoRun 远程命令执行服务")
     p.add_argument("--version", action="version", version=f"autoRun {__version__}")
@@ -290,6 +332,10 @@ def build_parser() -> argparse.ArgumentParser:
     kill.add_argument("job_id")
     kill.add_argument("-9", "--force", action="store_true", help="直接发送 SIGKILL")
     kill.set_defaults(func=cmd_kill)
+
+    gpu_p = sub.add_parser("gpu", help="采样并打印一次 GPU 利用率")
+    gpu_p.add_argument("--json", action="store_true", help="输出 JSON")
+    gpu_p.set_defaults(func=cmd_gpu)
 
     return p
 

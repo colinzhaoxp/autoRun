@@ -20,6 +20,7 @@ from .audit import AuditLog
 from .config import Config, KeyConfig
 from .errors import BadRequest, Conflict, Forbidden, JobNotFound, ValidationError
 from .executor import Executor
+from .monitor import GpuMonitor
 from .registry import JobRecord, Registry
 
 _SIGNAL_ALLOWLIST = {
@@ -46,6 +47,7 @@ class AppContext:
     audit: AuditLog
     rate_limiter: security.RateLimiter
     idempotency: security.IdempotencyCache
+    gpu_monitor: GpuMonitor | None = None
     started_at: float = field(default_factory=time.time)
     _cfg_lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -60,6 +62,8 @@ class AppContext:
             self.config = new_cfg
         self.executor.update_config(new_cfg)
         self.rate_limiter.update_config(new_cfg)
+        if self.gpu_monitor is not None:
+            self.gpu_monitor.update_config(new_cfg)
 
 
 @dataclass
@@ -127,13 +131,25 @@ def _job_view(rec: JobRecord) -> dict[str, Any]:
 def healthz(ctx: AppContext, req: Request) -> tuple[int, dict[str, Any]]:
     from . import __version__
 
-    return 200, {
+    payload = {
         "status": "ok",
         "version": __version__,
         "uptime_sec": round(time.time() - ctx.started_at, 1),
         "running_jobs": ctx.registry.running_count(),
         "pid": os.getpid(),
     }
+    if ctx.gpu_monitor is not None:
+        summary = ctx.gpu_monitor.health_summary()
+        if summary is not None:
+            payload["gpu"] = summary
+    return 200, payload
+
+
+def gpu_status(ctx: AppContext, req: Request) -> tuple[int, dict[str, Any]]:
+    """最近一次 GPU 快照 + 各规则去抖状态。"""
+    if ctx.gpu_monitor is None:
+        return 200, {"enabled": False, "snapshot": None, "rules": {}}
+    return 200, ctx.gpu_monitor.status()
 
 
 def list_commands(ctx: AppContext, req: Request) -> tuple[int, dict[str, Any]]:
@@ -347,6 +363,7 @@ ROUTES: list[tuple[str, str, Handler, bool]] = [
     # (method, path pattern, handler, 是否需要密钥认证)
     ("GET", "/healthz", healthz, False),
     ("GET", "/v1/commands", list_commands, True),
+    ("GET", "/v1/gpu", gpu_status, True),
     ("POST", "/v1/exec", exec_alias, True),
     ("POST", "/v1/exec/raw", exec_raw, True),
     ("GET", "/v1/processes", list_processes, True),

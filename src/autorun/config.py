@@ -24,6 +24,9 @@ from .errors import ConfigError
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 _PLACEHOLDER_PATTERN = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
+# GPU 规则可用的指标名。与 gpu.GpuSnapshot.metric 的键必须一致。
+_GPU_METRICS = ("avg_util", "idle_count", "min_gpu_util", "max_gpu_util", "max_temp", "max_mem_util")
+
 IPNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
 
 
@@ -185,6 +188,49 @@ class RegistryConfig:
 
 
 @dataclass(frozen=True)
+class SmtpConfig:
+    host: str
+    port: int
+    security: str = "ssl"  # ssl(465) | starttls(587) | none
+    username: str = ""
+    password: str = ""
+    from_addr: str = ""
+    timeout_sec: float = 15.0
+    proxy: str | None = None  # http(s)://host:port，经 CONNECT 隧道发信；None=直连
+
+
+@dataclass(frozen=True)
+class GpuActionConfig:
+    """一条触发动作。type 决定哪些字段生效。"""
+
+    type: str                       # log | exec | email
+    alias: str | None = None        # type=exec
+    to: tuple[str, ...] = ()        # type=email
+
+
+@dataclass(frozen=True)
+class GpuRuleConfig:
+    name: str
+    metric: str                     # 见 gpu.METRICS
+    comparator: str                 # below | above
+    threshold: float
+    duration_sec: int = 0           # 连续满足多久才触发（去抖）
+    cooldown_sec: int = 0           # 触发后冷却期，期间不重复
+    notify_resolved: bool = False   # 恢复正常后发"已恢复"
+    actions: tuple[GpuActionConfig, ...] = ()
+
+
+@dataclass(frozen=True)
+class GpuMonitorConfig:
+    enabled: bool = False
+    nvidia_smi: str | None = None       # None=自动 which
+    interval_sec: float = 15.0
+    sample_timeout_sec: float = 10.0
+    idle_util_threshold: float = 20.0
+    rules: tuple[GpuRuleConfig, ...] = ()
+
+
+@dataclass(frozen=True)
 class Config:
     source_path: Path
     base_dir: Path
@@ -198,6 +244,8 @@ class Config:
     paths: PathsConfig
     logging: LoggingConfig
     registry: RegistryConfig
+    gpu_monitor: GpuMonitorConfig = field(default_factory=GpuMonitorConfig)
+    smtp: SmtpConfig | None = None
     warnings: tuple[str, ...] = ()
 
     def find_key(self, presented: str) -> KeyConfig | None:
@@ -468,6 +516,179 @@ def _parse_keys(raw: Any, min_len: int) -> tuple[KeyConfig, ...]:
     return tuple(out)
 
 
+def _parse_smtp(raw: Any) -> SmtpConfig | None:
+    if not raw:
+        return None
+    if not isinstance(raw, dict):
+        raise ConfigError("smtp 必须是映射")
+    host = str(raw.get("host") or "")
+    if not host:
+        raise ConfigError("smtp.host 不能为空")
+    security = str(raw.get("security", "ssl")).lower()
+    if security not in ("ssl", "starttls", "none"):
+        raise ConfigError("smtp.security 只能是 ssl / starttls / none")
+    # 默认端口按 security 推断，显式给出优先。
+    default_port = 465 if security == "ssl" else 587 if security == "starttls" else 25
+    port = int(raw.get("port", default_port))
+    if not (1 <= port <= 65535):
+        raise ConfigError(f"smtp.port 越界: {port}")
+    from_addr = str(raw.get("from_addr") or raw.get("username") or "")
+    if not from_addr:
+        raise ConfigError("smtp.from_addr 不能为空（发件人地址）")
+    proxy = raw.get("proxy")
+    if proxy is not None:
+        proxy = str(proxy)
+        # 只支持 HTTP CONNECT 代理（内网常见的正向代理）。启动即校验形态，
+        # 免得等到 GPU 真空闲要发信时才发现代理地址写错。
+        import urllib.parse
+
+        pu = urllib.parse.urlparse(proxy)
+        if pu.scheme not in ("http", "https") or not pu.hostname:
+            raise ConfigError(
+                f"smtp.proxy 必须是 http(s)://host:port 形式，实际 {proxy!r}"
+            )
+    return SmtpConfig(
+        host=host,
+        port=port,
+        security=security,
+        username=str(raw.get("username") or ""),
+        password=str(raw.get("password") or ""),
+        from_addr=from_addr,
+        timeout_sec=float(raw.get("timeout_sec", 15)),
+        proxy=proxy,
+    )
+
+
+def _parse_gpu_actions(raw: Any, where: str, commands: dict[str, CommandSpec]) -> tuple[GpuActionConfig, ...]:
+    if raw is None:
+        return ()
+    if not isinstance(raw, list) or not raw:
+        raise ConfigError(f"{where} 必须是非空列表")
+    out: list[GpuActionConfig] = []
+    for i, item in enumerate(raw):
+        w = f"{where}[{i}]"
+        if not isinstance(item, dict):
+            raise ConfigError(f"{w} 必须是映射")
+        atype = str(item.get("type") or "")
+        if atype not in ("log", "exec", "email"):
+            raise ConfigError(f"{w}.type 只能是 log / exec / email，实际 {atype!r}")
+        alias: str | None = None
+        to: tuple[str, ...] = ()
+        if atype == "exec":
+            alias = str(item.get("alias") or "")
+            if not alias:
+                raise ConfigError(f"{w}.alias 不能为空（exec 动作必须指定别名）")
+            # 触发时才发现别名不存在就太晚了（可能是凌晨 GPU 掉了才触发）。启动即校验。
+            if alias not in commands:
+                raise ConfigError(
+                    f"{w}.alias 引用了未定义的命令: {alias!r}"
+                    f"（已定义: {sorted(commands) or '(无)'}）"
+                )
+        elif atype == "email":
+            rcpts = item.get("to")
+            if not isinstance(rcpts, list) or not rcpts:
+                raise ConfigError(f"{w}.to 必须是非空收件人列表")
+            to = tuple(str(r) for r in rcpts)
+        out.append(GpuActionConfig(type=atype, alias=alias, to=to))
+    return out
+
+
+def _parse_gpu_monitor(
+    raw: Any, commands: dict[str, CommandSpec], smtp: SmtpConfig | None, warnings: list[str]
+) -> GpuMonitorConfig:
+    if not raw:
+        return GpuMonitorConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("gpu_monitor 必须是映射")
+
+    enabled = bool(raw.get("enabled", False))
+    interval = float(raw.get("interval_sec", 15))
+    if interval <= 0:
+        raise ConfigError("gpu_monitor.interval_sec 必须为正数")
+    sample_timeout = float(raw.get("sample_timeout_sec", 10))
+    if sample_timeout <= 0:
+        raise ConfigError("gpu_monitor.sample_timeout_sec 必须为正数")
+    idle_threshold = float(raw.get("idle_util_threshold", 20))
+
+    rules_raw = raw.get("rules") or []
+    if not isinstance(rules_raw, list):
+        raise ConfigError("gpu_monitor.rules 必须是列表")
+
+    rules: list[GpuRuleConfig] = []
+    seen_names: set[str] = set()
+    needs_email = False
+    for i, item in enumerate(rules_raw):
+        where = f"gpu_monitor.rules[{i}]"
+        if not isinstance(item, dict):
+            raise ConfigError(f"{where} 必须是映射")
+        name = str(item.get("name") or "")
+        if not name:
+            raise ConfigError(f"{where}.name 不能为空")
+        # name 是去抖状态机的键，重名会串状态（两条规则共享 breach_since/cooldown）。
+        if name in seen_names:
+            raise ConfigError(f"{where}.name 重复: {name!r}")
+        seen_names.add(name)
+
+        metric = str(item.get("metric") or "")
+        if metric not in _GPU_METRICS:
+            raise ConfigError(
+                f"{where}.metric 非法: {metric!r}，可选 {sorted(_GPU_METRICS)}"
+            )
+        comparator = str(item.get("comparator") or "")
+        if comparator not in ("below", "above"):
+            raise ConfigError(f"{where}.comparator 只能是 below / above")
+        if "threshold" not in item:
+            raise ConfigError(f"{where}.threshold 必填")
+        try:
+            threshold = float(item["threshold"])
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(f"{where}.threshold 必须是数值") from exc
+
+        duration = int(item.get("duration_sec", 0))
+        if duration < 0:
+            raise ConfigError(f"{where}.duration_sec 不能为负")
+        cooldown = int(item.get("cooldown_sec", 0))
+        if cooldown < 0:
+            raise ConfigError(f"{where}.cooldown_sec 不能为负")
+
+        actions = _parse_gpu_actions(item.get("actions"), f"{where}.actions", commands)
+        if not actions:
+            raise ConfigError(f"{where}.actions 不能为空（规则无动作则毫无意义）")
+        if any(a.type == "email" for a in actions):
+            needs_email = True
+
+        rules.append(
+            GpuRuleConfig(
+                name=name,
+                metric=metric,
+                comparator=comparator,
+                threshold=threshold,
+                duration_sec=duration,
+                cooldown_sec=cooldown,
+                notify_resolved=bool(item.get("notify_resolved", False)),
+                actions=actions,
+            )
+        )
+
+    # 含 email 动作却没配 smtp：等到 GPU 真的空闲要发邮件时才失败太晚，启动即报错。
+    if needs_email and smtp is None:
+        raise ConfigError(
+            "gpu_monitor 存在 email 动作，但缺少 smtp 配置段（或 smtp.host 为空）"
+        )
+
+    if enabled and not rules:
+        warnings.append("gpu_monitor.enabled 为真但未配置任何 rules，监控线程将空转")
+
+    return GpuMonitorConfig(
+        enabled=enabled,
+        nvidia_smi=(str(raw["nvidia_smi"]) if raw.get("nvidia_smi") else None),
+        interval_sec=interval,
+        sample_timeout_sec=sample_timeout,
+        idle_util_threshold=idle_threshold,
+        rules=tuple(rules),
+    )
+
+
 def load(path: str | os.PathLike[str]) -> Config:
     """加载并全量校验配置。任何问题都抛 ConfigError，不返回半成品配置。"""
     cfg_path = Path(path).expanduser().resolve()
@@ -650,6 +871,9 @@ def load(path: str | os.PathLike[str]) -> Config:
         render_text_view=bool(reg_raw.get("render_text_view", True)),
     )
 
+    smtp = _parse_smtp(raw.get("smtp"))
+    gpu_monitor = _parse_gpu_monitor(raw.get("gpu_monitor"), commands, smtp, warnings)
+
     # --- 告警（不阻止启动，但必须让运维看见） ---
     try:
         host_addr = ipaddress.ip_address(server.host)
@@ -677,6 +901,16 @@ def load(path: str | os.PathLike[str]) -> Config:
             f"以下命令配置为不限时（timeout_sec: 0），不会被超时终止，"
             f"需自行 kill 或等其退出: {', '.join(unlimited)}"
         )
+    if gpu_monitor.enabled:
+        # 解析不到 nvidia-smi 不阻止启动（可能稍后才装/挂载），但监控会持续采样失败，
+        # 必须让运维看见，而不是默默地什么都不报警。
+        from .gpu import resolve_nvidia_smi
+
+        if resolve_nvidia_smi(gpu_monitor.nvidia_smi) is None:
+            warnings.append(
+                "gpu_monitor.enabled 为真但未找到 nvidia-smi（未配置 nvidia_smi 且 PATH 中不存在），"
+                "监控将持续采样失败。请配置 gpu_monitor.nvidia_smi 为绝对路径。"
+            )
 
     return Config(
         source_path=cfg_path,
@@ -691,5 +925,7 @@ def load(path: str | os.PathLike[str]) -> Config:
         paths=paths,
         logging=logging_cfg,
         registry=registry,
+        gpu_monitor=gpu_monitor,
+        smtp=smtp,
         warnings=tuple(warnings),
     )
